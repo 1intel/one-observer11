@@ -310,6 +310,8 @@ const MANIFEST = {
   term: { purposes: ["browse", "compare", "appraise"], validUntil: "2027-01-01" },
 };
 const INTERNAL = ["/__witness", "/__manifest", "/__dash", "/__presence", "/__mode", DIRECTORY_PATH];
+// Sub-resources a page pulls in are not sessions: forward them without evaluation or witness.
+const ASSET = /\.(?:js|mjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot|webmanifest|mp4|webm|mp3|pdf)$/i;
 
 export default {
   async fetch(req, env, ctx) {
@@ -321,6 +323,13 @@ export default {
     if (p === "/__presence") return presence(req, env, url);
     if (p === "/__mode") return mode(req, env);
     if (p === DIRECTORY_PATH && env.DEMO_AGENT_JWKS) return json(JSON.parse(env.DEMO_AGENT_JWKS));
+    if (ASSET.test(p)) return fetch(new Request(env.ORIGIN + p + url.search, req));
+
+    // One witness per session per epoch. Browsers get a session cookie; cookieless clients key on address + user agent.
+    const sid = sessionId(req);
+    if (sid.cookieless) sid.id = await cookielessId(req);
+    const seenKey = "s:" + sid.id + ":" + epoch();
+    const seen = await env.WITNESS.get(seenKey);
 
     const program = compile(SENTENCE, MANIFEST, { epoch: epoch(), rev: 1 });
     const evidence = await gather(req, env);
@@ -329,7 +338,10 @@ export default {
     const T = await transcript(program);
     const currentMode = (await env.WITNESS.get("mode")) || "observe";
     const decision = decide(verdict, evidence, currentMode, p, env);
-    ctx.waitUntil(witness(env, req, program, T, verdict, evidence, decision));
+    if (!seen || decision.action !== "allow") {
+      ctx.waitUntil(witness(env, req, program, T, verdict, evidence, decision));
+      ctx.waitUntil(env.WITNESS.put(seenKey, "1", { expirationTtl: 120 }));
+    }
 
     if (decision.action === "stepup") return Response.redirect(url.origin + "/__presence?next=" + encodeURIComponent(p + url.search), 302);
     if (decision.action === "refuse") return new Response("no key: " + verdict.why + " · witness " + decision.id, { status: 403, headers: { "x-one-witness": decision.id } });
@@ -337,11 +349,23 @@ export default {
     const out = new Response(upstream.body, upstream);
     out.headers.set("x-one-bucket", decision.bucket);
     out.headers.set("x-one-witness", decision.id);
+    if (sid.fresh) out.headers.append("Set-Cookie", `one_sid=${sid.id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`);
     return out;
   },
 };
 
 const epoch = () => Math.floor(Date.now() / 60000);
+function sessionId(req) {
+  const m = (req.headers.get("cookie") || "").match(/one_sid=([a-f0-9]{16})/);
+  if (m) return { id: m[1], fresh: false };
+  return { id: [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join(""), fresh: true, cookieless: true };
+}
+async function cookielessId(req) {
+  const ip = req.headers.get("cf-connecting-ip") || "";
+  const ua = req.headers.get("user-agent") || "";
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ip + "\u0000" + ua)));
+  return [...d.slice(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 // ---------- evidence: what the request carries ----------
 async function gather(req, env) {
