@@ -460,31 +460,50 @@ async function mode(req, env) {
   return json({ mode: m });
 }
 
-// ---------- proven human: invisible Turnstile, then a 24h presence cookie ----------
+// ---------- proven human: Turnstile (explicit render, self-diagnosing), then a 24h presence cookie ----------
 async function presence(req, env, url) {
   if (req.method === "POST") {
     const form = await req.formData();
     const token = form.get("cf-turnstile-response") || "";
+    if (!token) return html(diag("No token reached the server. The widget did not complete; go back and read the status line under the headline."), 400);
     const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST", body: new URLSearchParams({ secret: env.TURNSTILE_SECRET, response: token, remoteip: req.headers.get("cf-connecting-ip") || "" }),
-    }).then((x) => x.json()).catch(() => ({ success: false }));
-    if (!r.success) return new Response("presence not proven", { status: 403 });
+      method: "POST", body: new URLSearchParams({ secret: env.TURNSTILE_SECRET || "", response: token, remoteip: req.headers.get("cf-connecting-ip") || "" }),
+    }).then((x) => x.json()).catch((e) => ({ success: false, "error-codes": ["siteverify unreachable: " + e.message] }));
+    if (!r.success) return html(diag("Turnstile rejected the token: " + ((r["error-codes"] || []).join(", ") || "unknown") + ". invalid-input-secret means TURNSTILE_SECRET is wrong; hostname-mismatch means this hostname is not on the widget."), 403);
     const ts = String(Date.now());
     return new Response(null, { status: 302, headers: { Location: safeNext(form.get("next")), "Set-Cookie": `one_presence=${ts}.${await hmac(await presenceSecret(env), ts)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400` } });
   }
-  return html(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>one · presence</title>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-<body style="font-family:Georgia,serif;background:#000;color:#eee;display:grid;place-items:center;height:100vh;margin:0;text-align:center">
-<form method="POST" action="/__presence" id="f"><input type="hidden" name="next" value="${attr(url.searchParams.get("next") || "/")}">
+  const sitekey = env.TURNSTILE_SITEKEY || "";
+  return html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>one · presence</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoad&render=explicit" async defer></script>
+<style>body{font-family:Georgia,serif;background:#000;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0;text-align:center;padding:24px}#st{font-family:Menlo,monospace;font-size:12px;color:#9a9a9a;margin-top:14px;max-width:360px}#btn{display:none;margin-top:14px;background:#F2C614;color:#000;border:0;border-radius:22px;padding:12px 20px;font-size:15px;font-weight:700}</style></head>
+<body><form method="POST" action="/__presence" id="f"><input type="hidden" name="next" value="${attr(url.searchParams.get("next") || "/")}">
 <div style="font-size:26px;margin-bottom:14px">Proving a human is present.</div>
-<div class="cf-turnstile" data-sitekey="${attr(env.TURNSTILE_SITEKEY)}" data-callback="go" data-appearance="interaction-only"></div>
+<div id="w"></div>
+<button id="btn" type="submit">Continue</button>
+<div id="st">loading widget script…</div>
 <p style="font-size:14px;color:#9a9a9a">No account, no puzzle, one token. It becomes an identity row for 24 hours.</p></form>
-<script>function go(){document.getElementById('f').submit()}</script></body>`);
+<script>
+var st=document.getElementById('st'),key=${JSON.stringify(sitekey)};
+function say(t){st.textContent=t}
+if(!key)say('TURNSTILE_SITEKEY is not set on the worker (Settings → Variables and Secrets).');
+setTimeout(function(){if(!window.turnstile)say('widget script did not load after 6s. Check the network, or a content blocker on this browser.')},6000);
+function onTurnstileLoad(){
+  if(!key)return;
+  say('rendering widget for key '+key.slice(0,8)+'… on '+location.host);
+  try{turnstile.render('#w',{sitekey:key,appearance:'always',theme:'dark',callback:function(t){say('token received ('+t.length+' chars). submitting…');document.getElementById('btn').style.display='inline-block';document.getElementById('f').submit()},
+    'error-callback':function(c){say('turnstile error '+c+'. 110200 = this hostname is not on the widget; 400020 = site key does not exist; 300xxx = challenge could not run.')},
+    'expired-callback':function(){say('token expired, rendering again');turnstile.reset()},
+    'timeout-callback':function(){say('challenge timed out, rendering again');turnstile.reset()}});
+    say('widget rendered. waiting for Turnstile…')}catch(e){say('render failed: '+e.message)}
 }
+</script></body></html>`);
+}
+function diag(msg) { return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Georgia,serif;background:#000;color:#eee;padding:32px;line-height:1.5"><div style="font-size:22px">Presence not proven.</div><p style="font-family:Menlo,monospace;font-size:13px;color:#F87171;margin-top:12px">${attr(msg)}</p><p><a href="/__presence" style="color:#F2C614">Try again</a></p></body>`; }
 
 // ---------- helpers ----------
 const json = (o) => new Response(JSON.stringify(o), { headers: { "content-type": "application/json", "access-control-allow-origin": "*", "cache-control": "no-store" } });
-const html = (s) => new Response(s, { headers: { "content-type": "text/html; charset=utf-8" } });
+const html = (s, status = 200) => new Response(s, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 const attr = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const safeNext = (n) => (n && n.startsWith("/") && !n.startsWith("//") ? n : "/");
 async function hmac(secret, msg) {
